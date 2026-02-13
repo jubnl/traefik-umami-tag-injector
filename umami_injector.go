@@ -1,4 +1,4 @@
-package traefikUmamiTagInjector
+package traefikumamitaginjector
 
 import (
 	"bufio"
@@ -9,6 +9,7 @@ import (
 	"strings"
 )
 
+// Config holds the plugin configuration as provided by Traefik dynamic configuration.
 type Config struct {
 	ScriptSrc          string `json:"scriptSrc,omitempty"`
 	WebsiteID          string `json:"websiteId,omitempty"`         // NEW: allows per-router config via labels
@@ -18,6 +19,7 @@ type Config struct {
 	AlsoMatchBodyClose bool   `json:"alsoMatchBodyClose,omitempty"`
 }
 
+// CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
 		ScriptSrc:          "https://analytics.jubnl.ch/script.js",
@@ -29,6 +31,7 @@ func CreateConfig() *Config {
 	}
 }
 
+// Middleware is a Traefik HTTP middleware that injects an Umami tracking script into HTML responses.
 type Middleware struct {
 	next http.Handler
 
@@ -40,6 +43,7 @@ type Middleware struct {
 	alsoMatchBodyClose bool
 }
 
+// New constructs a new Middleware instance.
 func New(_ context.Context, next http.Handler, cfg *Config, _ string) (http.Handler, error) {
 	return &Middleware{
 		next: next,
@@ -78,7 +82,7 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	sw := newStreamWriter(rw, m.maxLookaheadBytes, m.scriptSrc, websiteID, m.injectBefore, m.alsoMatchBodyClose)
 	m.next.ServeHTTP(sw, req)
 
-	_ = sw.finish()
+	sw.finish()
 }
 
 func isUpgradeRequest(r *http.Request) bool {
@@ -294,14 +298,12 @@ func (w *streamWriter) flushBuffer() {
 	w.buf.Reset()
 }
 
-func (w *streamWriter) finish() error {
+func (w *streamWriter) finish() {
 	if w.state == undecided {
 		w.state = passthrough
 		w.flushHeaders()
 		w.flushBuffer()
 	}
-
-	return nil
 }
 
 // tryInject attempts injection into the provided bytes (assumed to be the beginning of HTML).

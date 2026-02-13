@@ -2,7 +2,7 @@ displayName: Analytics Script Injector
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/jubnl/traefik-analyticsinject
+import: github.com/jubnl/traefik-umami-tag-injector
 
 summary: Injects an analytics <script> tag into HTML responses based on a per-site website ID.
 

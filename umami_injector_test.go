@@ -1,4 +1,4 @@
-package traefikUmamiTagInjector
+package traefikumamitaginjector
 
 import (
 	"bytes"
@@ -12,7 +12,7 @@ import (
 func newTestMiddleware(t *testing.T, next http.Handler, cfg *Config) http.Handler {
 	t.Helper()
 
-	h, err := New(context.Background(), next, cfg, "traefikUmamiTagInjector")
+	h, err := New(context.Background(), next, cfg, "traefikumamitaginjector")
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
