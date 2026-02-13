@@ -1,12 +1,15 @@
-displayName: Demo Plugin
+displayName: Analytics Script Injector
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/traefik/plugindemo
+import: github.com/jubnl/traefik-analyticsinject
 
-summary: '[Demo] Add Request Header'
+summary: Injects an analytics <script> tag into HTML responses based on a per-site website ID.
 
 testData:
-  Headers:
-    X-Demo: test
-    X-URL: '{{URL}}'
+  scriptSrc: "https://analytics.jubnl.ch/script.js"
+  websiteId: "014f4608-ab91-44f8-a046-749b8593ada9"
+  websiteIdHeader: "X-Analytics-Website-Id"
+  maxLookaheadBytes: 131072
+  injectBefore: "</head>"
+  alsoMatchBodyClose: true
