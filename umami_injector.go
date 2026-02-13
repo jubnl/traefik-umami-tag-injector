@@ -159,6 +159,7 @@ func (w *streamWriter) WriteHeader(statusCode int) {
 	w.status = statusCode
 }
 
+//nolint:funlen
 func (w *streamWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
