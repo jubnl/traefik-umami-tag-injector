@@ -1,270 +1,146 @@
-This repository includes an example plugin, `demo`, for you to use as a reference for developing your own plugins.
+# Traefik Umami Tag Injector
 
-[![Build Status](https://github.com/traefik/plugindemo/workflows/Main/badge.svg?branch=master)](https://github.com/traefik/plugindemo/actions)
+A Traefik middleware plugin that injects an [Umami](https://umami.is) analytics `<script>` tag into eligible HTML
+responses.
 
-The existing plugins can be browsed into the [Plugin Catalog](https://plugins.traefik.io).
+The plugin is designed to be:
 
-# Developing a Traefik plugin
+- **Streaming-safe** – does not buffer entire responses.
+- **Memory-efficient** – only inspects the first part of the response.
+- **Per-site configurable** – the Umami `websiteId` can be set directly via Traefik labels.
+- **Non-intrusive** – skips non-HTML, compressed, websocket, and non-GET traffic.
 
-[Traefik](https://traefik.io) plugins are developed using the [Go language](https://golang.org).
+---
 
-A [Traefik](https://traefik.io) middleware plugin is just a [Go package](https://golang.org/ref/spec#Packages) that provides an `http.Handler` to perform specific processing of requests and responses.
+## Features
 
-Rather than being pre-compiled and linked, however, plugins are executed on the fly by [Yaegi](https://github.com/traefik/yaegi), an embedded Go interpreter.
+- Injects a `<script defer ...>` tag into HTML responses.
+- Streaming look-ahead injection (no full buffering).
+- Per-router configuration via labels (`websiteId`).
+- Fallback to header-based website ID if needed.
+- Case-insensitive `</head>` detection.
+- Optional fallback to `</body>` injection.
+- Safe passthrough for:
+    - Non-GET requests
+    - WebSocket / Upgrade requests
+    - Non-HTML responses
+    - Compressed responses
+    - Responses where the script already exists
+- Automatically removes `Content-Length` and `ETag` if injection occurs.
 
-## Usage
+---
 
-For a plugin to be active for a given Traefik instance, it must be declared in the static configuration.
+## How It Works
 
-Plugins are parsed and loaded exclusively during startup, which allows Traefik to check the integrity of the code and catch errors early on.
-If an error occurs during loading, the plugin is disabled.
+The middleware wraps the upstream response writer and:
 
-For security reasons, it is not possible to start a new plugin or modify an existing one while Traefik is running.
+1. Only processes **HTTP GET** requests.
+2. Skips WebSocket / Upgrade traffic.
+3. Determines the `websiteId`:
+    - First from middleware config (`websiteId`)
+    - Then from request header (`websiteIdHeader`)
+4. Streams the response and buffers only the first `maxLookaheadBytes`.
+5. Searches for `</head>` (case-insensitive).
+6. Injects the Umami script before `</head>` if found.
+7. Optionally falls back to `</body>` if enabled.
+8. If neither is found within the lookahead window, the response is passed through unchanged.
 
-Once loaded, middleware plugins behave exactly like statically compiled middlewares.
-Their instantiation and behavior are driven by the dynamic configuration.
+---
 
-Plugin dependencies must be [vendored](https://golang.org/ref/mod#vendoring) for each plugin.
-Vendored packages should be included in the plugin's GitHub repository. ([Go modules](https://blog.golang.org/using-go-modules) are not supported.)
+## Default Script Injected
 
-### Configuration
+```html
 
-For each plugin, the Traefik static configuration must define the module name (as is usual for Go packages).
+<script defer src="https://analytics.jubnl.ch/script.js" data-website-id="YOUR_ID"></script>
+```
 
-The following declaration (given here in YAML) defines a plugin:
+## Configuration
+
+### Plugin configuration Fields
+
+| Field                | Type   | Default                                | Description                                                  |
+|----------------------|--------|----------------------------------------|--------------------------------------------------------------|
+| `scriptSrc`          | string | `https://analytics.jubnl.ch/script.js` | URL of the analytics script.                                 |
+| `websiteId`          | string | `""`                                   | Umami website ID. If empty, header fallback is used.         |
+| `websiteIdHeader`    | string | `X-Analytics-Website-Id`               | Header name used when `websiteId` is not set.                |
+| `maxLookaheadBytes`  | int    | `131072` (128 KiB)                     | Maximum bytes to buffer while searching for injection point. |
+| `injectBefore`       | string | `</head>`                              | HTML tag to inject before. Case-insensitive.                 |
+| `alsoMatchBodyClose` | bool   | `true`                                 | If `</head>` is not found, try `</body>`.                    |
+
+## Installation
+
+### Static Traefik Configuration
 
 ```yaml
-# Static configuration
-
-experimental:
-  plugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-      version: v0.2.1
-```
-
-Here is an example of a file provider dynamic configuration (given here in YAML), where the interesting part is the `http.middlewares` section:
-
-```yaml
-# Dynamic configuration
-
-http:
-  routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
-      middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
-```
-
-### Local Mode
-
-Traefik also offers a developer mode that can be used for temporary testing of plugins not hosted on GitHub.
-To use a plugin in local mode, the Traefik static configuration must define the module name (as is usual for Go packages) and a path to a [Go workspace](https://golang.org/doc/gopath_code.html#Workspaces), which can be the local GOPATH or any directory.
-
-The plugins must be placed in `./plugins-local` directory,
-which should be in the working directory of the process running the Traefik binary.
-The source code of the plugin should be organized as follows:
-
-```
-./plugins-local/
-    └── src
-        └── github.com
-            └── traefik
-                └── plugindemo
-                    ├── demo.go
-                    ├── demo_test.go
-                    ├── go.mod
-                    ├── LICENSE
-                    ├── Makefile
-                    └── readme.md
-```
-
-```yaml
-# Static configuration
-
 experimental:
   localPlugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
+    analyticsinject:
+      moduleName: github.com/jubnl/traefik-umami-tag-injector
 ```
 
-(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/traefik/plugindemo`.)
+### Usage with traefik labels
+
+Set the `websiteId` directly via labels, no dynamic file edits required.
 
 ```yaml
-# Dynamic configuration
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.myapp.rule=Host(`example.com`)"
+  - "traefik.http.routers.myapp.entrypoints=websecure"
 
-http:
-  routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
-      middlewares:
-        - my-plugin
+  - "traefik.http.middlewares.myapp-umami.plugin.analyticsinject.websiteId=YOUR_UMAMI_ID"
 
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
+  - "traefik.http.routers.myapp.middlewares=myapp-umami"
 ```
 
-## Defining a Plugin
+Only the `websiteId` label needs to change per site.
 
-A plugin package must define the following exported Go objects:
+### Optional: Header Fallback Mode
 
-- A type `type Config struct { ... }`. The struct fields are arbitrary.
-- A function `func CreateConfig() *Config`.
-- A function `func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error)`.
-
-```go
-// Package example a example plugin.
-package example
-
-import (
-	"context"
-	"net/http"
-)
-
-// Config the plugin configuration.
-type Config struct {
-	// ...
-}
-
-// CreateConfig creates the default plugin configuration.
-func CreateConfig() *Config {
-	return &Config{
-		// ...
-	}
-}
-
-// Example a plugin.
-type Example struct {
-	next     http.Handler
-	name     string
-	// ...
-}
-
-// New created a new plugin.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// ...
-	return &Example{
-		// ...
-	}, nil
-}
-
-func (e *Example) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// ...
-	e.next.ServeHTTP(rw, req)
-}
-```
-
-## Logs
-
-Currently, the only way to send logs to Traefik is to use `os.Stdout.WriteString("...")` or `os.Stderr.WriteString("...")`.
-
-In the future, we will try to provide something better and based on levels.
-
-## Plugins Catalog
-
-Traefik plugins are stored and hosted as public GitHub repositories.
-
-Once a day, the Plugins Catalog online service polls Github to find plugins and add them to its catalog.
-
-### Prerequisites
-
-To be recognized by Plugins Catalog, your repository must meet the following criteria:
-
-- The `traefik-plugin` topic must be set.
-- The `.traefik.yml` manifest must exist, and be filled with valid contents.
-
-If your repository fails to meet either of these prerequisites, Plugins Catalog will not see it.
-
-### Manifest
-
-A manifest is also mandatory, and it should be named `.traefik.yml` and stored at the root of your project.
-
-This YAML file provides Plugins Catalog with information about your plugin, such as a description, a full name, and so on.
-
-Here is an example of a typical `.traefik.yml`file:
+If you prefer setting the ID via header instead of middleware config:
 
 ```yaml
-# The name of your plugin as displayed in the Plugins Catalog web UI.
-displayName: Name of your plugin
-
-# For now, `middleware` is the only type available.
-type: middleware
-
-# The import path of your plugin.
-import: github.com/username/my-plugin
-
-# A brief description of what your plugin is doing.
-summary: Description of what my plugin is doing
-
-# Medias associated to the plugin (optional)
-iconPath: foo/icon.png
-bannerPath: foo/banner.png
-
-# Configuration data for your plugin.
-# This is mandatory,
-# and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-testData:
-  Headers:
-    Foo: Bar
+- "traefik.http.middlewares.myapp-umami.headers.customrequestheaders.X-Analytics-Website-Id=YOUR_ID"
 ```
 
-Properties include:
+## Behavior Summary
 
-- `displayName` (required): The name of your plugin as displayed in the Plugins Catalog web UI.
-- `type` (required): For now, `middleware` is the only type available.
-- `import` (required): The import path of your plugin.
-- `summary` (required): A brief description of what your plugin is doing.
-- `testData` (required): Configuration data for your plugin. This is mandatory, and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-- `iconPath` (optional): A local path in the repository to the icon of the project.
-- `bannerPath` (optional): A local path in the repository to the image that will be used when you will share your plugin page in social medias.
+| Scenario                                | Result                               |
+|-----------------------------------------|--------------------------------------|
+| Non-GET request                         | Passthrough                          |
+| WebSocket / Upgrade                     | Passthrough                          |
+| Non-HTML response                       | Passthrough                          |
+| Compressed response                     | Passthrough                          |
+| Script already present                  | Passthrough                          |
+| `</head>` found                         | Inject before it                     |
+| `</head>` not found but `</body>` found | Inject before `</body>` (if enabled) |
+| No injection point found                | Passthrough                          |
+| Large responses                         | Safe streaming, no truncation        |
 
-There should also be a `go.mod` file at the root of your project. Plugins Catalog will use this file to validate the name of the project.
+## Performance Notes
 
-### Tags and Dependencies
+- No full response buffering.
+- Memory usage bounded by maxLookaheadBytes.
+- Designed for high-traffic environments.
 
-Plugins Catalog gets your sources from a Go module proxy, so your plugins need to be versioned with a git tag.
+## Security Considerations
 
-Last but not least, if your plugin middleware has Go package dependencies, you need to vendor them and add them to your GitHub repository.
+- Does not modify CSP headers automatically.
+- If your site uses strict CSP, you must allow the script domain manually.
+- Only modifies HTML content types.
 
-If something goes wrong with the integration of your plugin, Plugins Catalog will create an issue inside your Github repository and will stop trying to add your repo until you close the issue.
+## Development
 
-## Troubleshooting
+Run tests:
 
-If Plugins Catalog fails to recognize your plugin, you will need to make one or more changes to your GitHub repository.
+```shell
+go test -v ./...
+```
 
-In order for your plugin to be successfully imported by Plugins Catalog, consult this checklist:
+## License
 
-- The `traefik-plugin` topic must be set on your repository.
-- There must be a `.traefik.yml` file at the root of your project describing your plugin, and it must have a valid `testData` property for testing purposes.
-- There must be a valid `go.mod` file at the root of your project.
-- Your plugin must be versioned with a git tag.
-- If you have package dependencies, they must be vendored and added to your GitHub repository.
+MIT
+
+## Suggestions / Feedback
+
+Please open an issue or PR.

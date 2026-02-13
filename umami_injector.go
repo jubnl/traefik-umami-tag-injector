@@ -1,3 +1,5 @@
+// Package traefikumamitaginjector provides a Traefik middleware that injects an Umami tracking script
+// into eligible HTML responses.
 package traefikumamitaginjector
 
 import (
@@ -344,7 +346,8 @@ func tryInject(prefix []byte, scriptSrc, websiteID, injectBefore string, alsoMat
 	return nil, false
 }
 
-// Support Flush/Hijack to not break other handlers.
+// Flush implements http.Flusher. If we haven't decided yet whether to inject,
+// we fall back to passthrough before flushing to avoid partial/invalid rewrites.
 func (w *streamWriter) Flush() {
 	if w.state == undecided {
 		w.state = passthrough
