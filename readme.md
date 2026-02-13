@@ -8,7 +8,8 @@ The plugin is designed to be:
 - **Streaming-safe** – does not buffer entire responses.
 - **Memory-efficient** – only inspects the first part of the response.
 - **Per-site configurable** – the Umami `websiteId` can be set directly via Traefik labels.
-- **Non-intrusive** – skips non-HTML, compressed, websocket, and non-GET traffic.
+- **Compression-aware** – can transparently request uncompressed responses from upstream.
+- **Non-intrusive** – skips non-HTML, websocket, and non-GET traffic.
 
 ---
 
@@ -20,11 +21,11 @@ The plugin is designed to be:
 - Fallback to header-based website ID if needed.
 - Case-insensitive `</head>` detection.
 - Optional fallback to `</body>` injection.
+- Optional upstream decompression strategy via `stripAcceptEncoding`.
 - Safe passthrough for:
     - Non-GET requests
     - WebSocket / Upgrade requests
     - Non-HTML responses
-    - Compressed responses
     - Responses where the script already exists
 - Automatically removes `Content-Length` and `ETag` if injection occurs.
 
@@ -39,11 +40,12 @@ The middleware wraps the upstream response writer and:
 3. Determines the `websiteId`:
     - First from middleware config (`websiteId`)
     - Then from request header (`websiteIdHeader`)
-4. Streams the response and buffers only the first `maxLookaheadBytes`.
-5. Searches for `</head>` (case-insensitive).
-6. Injects the Umami script before `</head>` if found.
-7. Optionally falls back to `</body>` if enabled.
-8. If neither is found within the lookahead window, the response is passed through unchanged.
+4. Optionally strips `Accept-Encoding` before proxying upstream (default enabled).
+5. Streams the response and buffers only the first `maxLookaheadBytes`.
+6. Searches for `</head>` (case-insensitive).
+7. Injects the Umami script before `</head>` if found.
+8. Optionally falls back to `</body>` if enabled.
+9. If neither is found within the lookahead window, the response is passed through unchanged.
 
 ---
 
@@ -58,14 +60,38 @@ The middleware wraps the upstream response writer and:
 
 ### Plugin configuration Fields
 
-| Field                | Type   | Default                                | Description                                                  |
-|----------------------|--------|----------------------------------------|--------------------------------------------------------------|
-| `scriptSrc`          | string | `https://analytics.jubnl.ch/script.js` | URL of the analytics script.                                 |
-| `websiteId`          | string | `""`                                   | Umami website ID. If empty, header fallback is used.         |
-| `websiteIdHeader`    | string | `X-Analytics-Website-Id`               | Header name used when `websiteId` is not set.                |
-| `maxLookaheadBytes`  | int    | `131072` (128 KiB)                     | Maximum bytes to buffer while searching for injection point. |
-| `injectBefore`       | string | `</head>`                              | HTML tag to inject before. Case-insensitive.                 |
-| `alsoMatchBodyClose` | bool   | `true`                                 | If `</head>` is not found, try `</body>`.                    |
+| Field                 | Type   | Default                                | Description                                                                                                                                                                               |
+|-----------------------|--------|----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `scriptSrc`           | string | `https://analytics.jubnl.ch/script.js` | URL of the analytics script.                                                                                                                                                              |
+| `websiteId`           | string | `""`                                   | Umami website ID. If empty, header fallback is used.                                                                                                                                      |
+| `websiteIdHeader`     | string | `X-Analytics-Website-Id`               | Header name used when `websiteId` is not set.                                                                                                                                             |
+| `maxLookaheadBytes`   | int    | `131072` (128 KiB)                     | Maximum bytes to buffer while searching for injection point.                                                                                                                              |
+| `injectBefore`        | string | `</head>`                              | HTML tag to inject before. Case-insensitive.                                                                                                                                              |
+| `alsoMatchBodyClose`  | bool   | `true`                                 | If `</head>` is not found, try `</body>`.                                                                                                                                                 |
+| `stripAcceptEncoding` | bool   | `true`                                 | Removes `Accept-Encoding` before upstream request so servers usually return uncompressed HTML, allowing safe injection. Disable only if you explicitly want to keep upstream compression. |
+
+## Compression Handling
+
+By default, the plugin sets `stripAcceptEncoding = true`.
+
+This means:
+
+- The middleware removes Accept-Encoding from the request before forwarding it to the upstream server.
+- Most web servers will then return uncompressed HTML.
+- The plugin injects the script safely.
+- Traefik’s own compress middleware (if enabled) can compress the final response afterward.
+
+If an upstream server **always compresses regardless of headers**, injection will be skipped and the response passed
+through unchanged.
+
+Middleware Ordering Recommendation
+
+When using Traefik's compress middleware:
+
+1. Umami Injector
+2. Compress
+
+The injector must run **before** compression.
 
 ## Installation
 
@@ -76,6 +102,7 @@ experimental:
   localPlugins:
     analyticsinject:
       moduleName: github.com/jubnl/traefik-umami-tag-injector
+      version: v1.0.3
 ```
 
 ### Usage with traefik labels
@@ -110,8 +137,8 @@ If you prefer setting the ID via header instead of middleware config:
 | Non-GET request                         | Passthrough                          |
 | WebSocket / Upgrade                     | Passthrough                          |
 | Non-HTML response                       | Passthrough                          |
-| Compressed response                     | Passthrough                          |
 | Script already present                  | Passthrough                          |
+| Upstream forces compression             | Passthrough                          |
 | `</head>` found                         | Inject before it                     |
 | `</head>` not found but `</body>` found | Inject before `</body>` (if enabled) |
 | No injection point found                | Passthrough                          |

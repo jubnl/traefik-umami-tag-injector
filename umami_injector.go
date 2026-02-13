@@ -13,23 +13,25 @@ import (
 
 // Config holds the plugin configuration as provided by Traefik dynamic configuration.
 type Config struct {
-	ScriptSrc          string `json:"scriptSrc,omitempty"`
-	WebsiteID          string `json:"websiteId,omitempty"`         // NEW: allows per-router config via labels
-	WebsiteIDHeader    string `json:"websiteIdHeader,omitempty"`   // fallback, e.g. X-Analytics-Website-Id
-	MaxLookaheadBytes  int    `json:"maxLookaheadBytes,omitempty"` // e.g. 131072 (128 KiB)
-	InjectBefore       string `json:"injectBefore,omitempty"`      // default </head>
-	AlsoMatchBodyClose bool   `json:"alsoMatchBodyClose,omitempty"`
+	ScriptSrc           string `json:"scriptSrc,omitempty"`
+	WebsiteID           string `json:"websiteId,omitempty"`         // NEW: allows per-router config via labels
+	WebsiteIDHeader     string `json:"websiteIdHeader,omitempty"`   // fallback, e.g. X-Analytics-Website-Id
+	MaxLookaheadBytes   int    `json:"maxLookaheadBytes,omitempty"` // e.g. 131072 (128 KiB)
+	InjectBefore        string `json:"injectBefore,omitempty"`      // default </head>
+	AlsoMatchBodyClose  bool   `json:"alsoMatchBodyClose,omitempty"`
+	StripAcceptEncoding bool   `json:"stripAcceptEncoding,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		ScriptSrc:          "https://analytics.jubnl.ch/script.js",
-		WebsiteID:          "", // per-site; empty means "use header fallback"
-		WebsiteIDHeader:    "X-Analytics-Website-Id",
-		MaxLookaheadBytes:  128 * 1024,
-		InjectBefore:       "</head>",
-		AlsoMatchBodyClose: true,
+		ScriptSrc:           "https://analytics.jubnl.ch/script.js",
+		WebsiteID:           "", // per-site; empty means "use header fallback"
+		WebsiteIDHeader:     "X-Analytics-Website-Id",
+		MaxLookaheadBytes:   128 * 1024,
+		InjectBefore:        "</head>",
+		AlsoMatchBodyClose:  true,
+		StripAcceptEncoding: true,
 	}
 }
 
@@ -37,12 +39,13 @@ func CreateConfig() *Config {
 type Middleware struct {
 	next http.Handler
 
-	scriptSrc          string
-	websiteID          string // NEW
-	websiteIDHeader    string
-	maxLookaheadBytes  int
-	injectBefore       string
-	alsoMatchBodyClose bool
+	scriptSrc           string
+	websiteID           string
+	websiteIDHeader     string
+	maxLookaheadBytes   int
+	injectBefore        string
+	alsoMatchBodyClose  bool
+	stripAcceptEncoding bool
 }
 
 // New constructs a new Middleware instance.
@@ -50,12 +53,13 @@ func New(_ context.Context, next http.Handler, cfg *Config, _ string) (http.Hand
 	return &Middleware{
 		next: next,
 
-		scriptSrc:          cfg.ScriptSrc,
-		websiteID:          strings.TrimSpace(cfg.WebsiteID), // NEW
-		websiteIDHeader:    cfg.WebsiteIDHeader,
-		maxLookaheadBytes:  cfg.MaxLookaheadBytes,
-		injectBefore:       cfg.InjectBefore,
-		alsoMatchBodyClose: cfg.AlsoMatchBodyClose,
+		scriptSrc:           cfg.ScriptSrc,
+		websiteID:           strings.TrimSpace(cfg.WebsiteID),
+		websiteIDHeader:     cfg.WebsiteIDHeader,
+		maxLookaheadBytes:   cfg.MaxLookaheadBytes,
+		injectBefore:        cfg.InjectBefore,
+		alsoMatchBodyClose:  cfg.AlsoMatchBodyClose,
+		stripAcceptEncoding: cfg.StripAcceptEncoding,
 	}, nil
 }
 
@@ -65,13 +69,11 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Skip websocket/upgrade traffic (GET can be websockets).
 	if isUpgradeRequest(req) {
 		m.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// NEW: prefer middleware config WebsiteID (labels), fallback to request header if empty.
 	websiteID := m.websiteID
 	if websiteID == "" {
 		websiteID = strings.TrimSpace(req.Header.Get(m.websiteIDHeader))
@@ -81,8 +83,16 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	reqToForward := req
+	if m.stripAcceptEncoding {
+		cloned := req.Clone(req.Context())
+		cloned.Header = req.Header.Clone()
+		cloned.Header.Del("Accept-Encoding")
+		reqToForward = cloned
+	}
+
 	sw := newStreamWriter(rw, m.maxLookaheadBytes, m.scriptSrc, websiteID, m.injectBefore, m.alsoMatchBodyClose)
-	m.next.ServeHTTP(sw, req)
+	m.next.ServeHTTP(sw, reqToForward)
 
 	sw.finish()
 }

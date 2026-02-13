@@ -357,3 +357,216 @@ func Test_FallbackToBodyClose(t *testing.T) {
 		t.Fatalf("expected snippet before </body>")
 	}
 }
+
+func Test_StripAcceptEncoding_DefaultTrue_StripsHeaderBeforeUpstream(t *testing.T) {
+	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+
+	var sawAcceptEncoding string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
+
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	// default is true, but keep explicit to avoid future regressions
+	cfg.StripAcceptEncoding = true
+	cfg.WebsiteID = websiteID
+	cfg.MaxLookaheadBytes = 32 * 1024
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	if sawAcceptEncoding != "" {
+		t.Fatalf("expected Accept-Encoding to be stripped before upstream, got %q", sawAcceptEncoding)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, cfg.ScriptSrc) {
+		t.Fatalf("expected injection to occur, got body=%q", body)
+	}
+}
+
+func Test_StripAcceptEncoding_False_DoesNotStripHeaderBeforeUpstream(t *testing.T) {
+	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+
+	var sawAcceptEncoding string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
+
+		// Return uncompressed anyway; we only validate header forwarding here.
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.StripAcceptEncoding = false
+	cfg.WebsiteID = websiteID
+	cfg.MaxLookaheadBytes = 32 * 1024
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	if sawAcceptEncoding != "gzip, br" {
+		t.Fatalf("expected Accept-Encoding to be preserved before upstream, got %q", sawAcceptEncoding)
+	}
+
+	// Injection should still occur because upstream returned uncompressed HTML.
+	body := rr.Body.String()
+	if !strings.Contains(body, cfg.ScriptSrc) {
+		t.Fatalf("expected injection to occur, got body=%q", body)
+	}
+}
+
+func Test_StripAcceptEncoding_True_AllowsInjection_WhenUpstreamCompressesConditionally(t *testing.T) {
+	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+
+	// This upstream simulates typical behavior: compress only when Accept-Encoding includes gzip.
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		ae := r.Header.Get("Accept-Encoding")
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+		if strings.Contains(ae, "gzip") {
+			// We are not actually gzipping here; we just set the header to trigger plugin passthrough path.
+			rw.Header().Set("Content-Encoding", "gzip")
+		}
+
+		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.StripAcceptEncoding = true
+	cfg.WebsiteID = websiteID
+	cfg.MaxLookaheadBytes = 32 * 1024
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	// Because we stripped Accept-Encoding, upstream should NOT set Content-Encoding.
+	if rr.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("expected upstream to not send Content-Encoding when Accept-Encoding stripped, got %q", rr.Header().Get("Content-Encoding"))
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, cfg.ScriptSrc) {
+		t.Fatalf("expected injection to occur, got body=%q", body)
+	}
+}
+
+func Test_StripAcceptEncoding_False_SkipsInjection_WhenUpstreamRespondsCompressed(t *testing.T) {
+	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+
+	// Simulate upstream that sets Content-Encoding when client advertises gzip.
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			rw.Header().Set("Content-Encoding", "gzip")
+		}
+
+		// Body content doesn't matter; plugin should passthrough because Content-Encoding is set.
+		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.StripAcceptEncoding = false
+	cfg.WebsiteID = websiteID
+	cfg.MaxLookaheadBytes = 32 * 1024
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	if rr.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("expected Content-Encoding=gzip passthrough, got %q", rr.Header().Get("Content-Encoding"))
+	}
+
+	body := rr.Body.String()
+	if strings.Contains(body, cfg.ScriptSrc) {
+		t.Fatalf("expected no injection when upstream response is compressed, got body=%q", body)
+	}
+}
+
+func Test_StripAcceptEncoding_DoesNotMutateOriginalRequestObject(t *testing.T) {
+	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.StripAcceptEncoding = true
+	cfg.WebsiteID = websiteID
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+
+	rr := httptest.NewRecorder()
+	mw.ServeHTTP(rr, req)
+
+	// Ensure we did not mutate the original request's headers.
+	if got := req.Header.Get("Accept-Encoding"); got != "gzip, br" {
+		t.Fatalf("expected original request Accept-Encoding unchanged, got %q", got)
+	}
+}
+
+func Test_StripAcceptEncoding_True_WorksOnLargeResponse(t *testing.T) {
+	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+
+	var sawAcceptEncoding string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
+
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = rw.Write([]byte("<html><head></head><body>"))
+		_, _ = rw.Write(bytes.Repeat([]byte("A"), 2*1024*1024))
+		_, _ = rw.Write([]byte("</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.StripAcceptEncoding = true
+	cfg.WebsiteID = websiteID
+	cfg.MaxLookaheadBytes = 32 * 1024
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	if sawAcceptEncoding != "" {
+		t.Fatalf("expected Accept-Encoding stripped before upstream, got %q", sawAcceptEncoding)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, cfg.ScriptSrc) {
+		t.Fatalf("expected injection to occur")
+	}
+	if !strings.Contains(body, "</body></html>") {
+		t.Fatalf("expected response not truncated")
+	}
+}
