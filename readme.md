@@ -166,7 +166,7 @@ go test -v ./...
 
 ## License
 
-MIT
+Apache License 2.0
 
 ## Suggestions / Feedback
 
