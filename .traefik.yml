@@ -14,3 +14,4 @@ testData:
   maxLookaheadBytes: 131072
   injectBefore: "</head>"
   alsoMatchBodyClose: true
+  injectOnNon2xx: false
