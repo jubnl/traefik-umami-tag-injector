@@ -8,7 +8,8 @@ summary: Injects an analytics <script> tag into HTML responses based on a per-si
 
 testData:
   scriptSrc: "https://analytics.jubnl.ch/script.js"
-  websiteId: "014f4608-ab91-44f8-a046-749b8593ada9"
+  websiteId: "c1df940e-066c-40df-a48a-fb0c92eac0a3"
+  defaultWebsiteID: "c1df940e-066c-40df-a48a-fb0c92eac0a3"
   websiteIdHeader: "X-Analytics-Website-Id"
   maxLookaheadBytes: 131072
   injectBefore: "</head>"
