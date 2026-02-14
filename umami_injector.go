@@ -11,27 +11,39 @@ import (
 	"strings"
 )
 
+type htmlCandidate int
+
+const (
+	candidateNo htmlCandidate = iota
+	candidateMaybe
+	candidateYes
+)
+
 // Config holds the plugin configuration as provided by Traefik dynamic configuration.
 type Config struct {
 	ScriptSrc           string `json:"scriptSrc,omitempty"`
-	WebsiteID           string `json:"websiteId,omitempty"`         // NEW: allows per-router config via labels
+	WebsiteID           string `json:"websiteId,omitempty"` // per-router override via labels
+	DefaultWebsiteID    string `json:"defaultWebsiteId,omitempty"`
 	WebsiteIDHeader     string `json:"websiteIdHeader,omitempty"`   // fallback, e.g. X-Analytics-Website-Id
 	MaxLookaheadBytes   int    `json:"maxLookaheadBytes,omitempty"` // e.g. 131072 (128 KiB)
 	InjectBefore        string `json:"injectBefore,omitempty"`      // default </head>
 	AlsoMatchBodyClose  bool   `json:"alsoMatchBodyClose,omitempty"`
 	StripAcceptEncoding bool   `json:"stripAcceptEncoding,omitempty"`
+	InjectOnNon2xx      bool   `json:"injectOnNon2xx,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
 		ScriptSrc:           "https://analytics.jubnl.ch/script.js",
-		WebsiteID:           "", // per-site; empty means "use header fallback"
+		WebsiteID:           "",
 		WebsiteIDHeader:     "X-Analytics-Website-Id",
-		MaxLookaheadBytes:   128 * 1024,
+		DefaultWebsiteID:    "c1df940e-066c-40df-a48a-fb0c92eac0a3",
+		MaxLookaheadBytes:   32 * 1024,
 		InjectBefore:        "</head>",
 		AlsoMatchBodyClose:  true,
 		StripAcceptEncoding: true,
+		InjectOnNon2xx:      false,
 	}
 }
 
@@ -41,11 +53,13 @@ type Middleware struct {
 
 	scriptSrc           string
 	websiteID           string
+	defaultWebsiteID    string
 	websiteIDHeader     string
 	maxLookaheadBytes   int
 	injectBefore        string
 	alsoMatchBodyClose  bool
 	stripAcceptEncoding bool
+	injectOnNon2xx      bool
 }
 
 // New constructs a new Middleware instance.
@@ -55,11 +69,13 @@ func New(_ context.Context, next http.Handler, cfg *Config, _ string) (http.Hand
 
 		scriptSrc:           cfg.ScriptSrc,
 		websiteID:           strings.TrimSpace(cfg.WebsiteID),
+		defaultWebsiteID:    strings.TrimSpace(cfg.DefaultWebsiteID),
 		websiteIDHeader:     cfg.WebsiteIDHeader,
 		maxLookaheadBytes:   cfg.MaxLookaheadBytes,
 		injectBefore:        cfg.InjectBefore,
 		alsoMatchBodyClose:  cfg.AlsoMatchBodyClose,
 		stripAcceptEncoding: cfg.StripAcceptEncoding,
+		injectOnNon2xx:      cfg.InjectOnNon2xx,
 	}, nil
 }
 
@@ -74,9 +90,12 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	websiteID := m.websiteID
+	websiteID := strings.TrimSpace(m.websiteID)
 	if websiteID == "" {
 		websiteID = strings.TrimSpace(req.Header.Get(m.websiteIDHeader))
+	}
+	if websiteID == "" {
+		websiteID = strings.TrimSpace(m.defaultWebsiteID)
 	}
 	if websiteID == "" {
 		m.next.ServeHTTP(rw, req)
@@ -91,7 +110,15 @@ func (m *Middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		reqToForward = cloned
 	}
 
-	sw := newStreamWriter(rw, m.maxLookaheadBytes, m.scriptSrc, websiteID, m.injectBefore, m.alsoMatchBodyClose)
+	sw := newStreamWriter(
+		rw,
+		m.maxLookaheadBytes,
+		m.scriptSrc,
+		websiteID,
+		m.injectBefore,
+		m.alsoMatchBodyClose,
+		m.injectOnNon2xx,
+	)
 	m.next.ServeHTTP(sw, reqToForward)
 
 	sw.finish()
@@ -133,9 +160,10 @@ type streamWriter struct {
 	websiteID          string
 	injectBefore       string
 	alsoMatchBodyClose bool
+	injectOnNon2xx     bool
 }
 
-func newStreamWriter(orig http.ResponseWriter, lookaheadLimit int, scriptSrc, websiteID, injectBefore string, alsoMatchBodyClose bool) *streamWriter {
+func newStreamWriter(orig http.ResponseWriter, lookaheadLimit int, scriptSrc, websiteID, injectBefore string, alsoMatchBodyClose bool, injectOnNon2xx bool) *streamWriter {
 	if lookaheadLimit <= 0 {
 		lookaheadLimit = 64 * 1024
 	}
@@ -153,6 +181,7 @@ func newStreamWriter(orig http.ResponseWriter, lookaheadLimit int, scriptSrc, we
 		websiteID:          websiteID,
 		injectBefore:       injectBefore,
 		alsoMatchBodyClose: alsoMatchBodyClose,
+		injectOnNon2xx:     injectOnNon2xx,
 	}
 }
 
@@ -167,6 +196,72 @@ func (w *streamWriter) WriteHeader(statusCode int) {
 
 	w.wroteHeader = true
 	w.status = statusCode
+}
+
+// Decide based on status + headers + (optional) sniffing.
+func (w *streamWriter) htmlCandidateFromHeadersAndSniff(sample []byte) htmlCandidate {
+	if !w.isStatusEligible() {
+		return candidateNo
+	}
+
+	ct := strings.ToLower(w.header.Get("Content-Type"))
+
+	// Explicit HTML => yes.
+	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml+xml") {
+		return candidateYes
+	}
+
+	// Explicit non-empty and NOT html => no.
+	if strings.TrimSpace(ct) != "" {
+		return candidateNo
+	}
+
+	// CT is empty => sniff the prefix.
+	return sniffHTML(sample)
+}
+
+func (w *streamWriter) isStatusEligible() bool {
+	if w.injectOnNon2xx {
+		return w.status >= 200 && w.status < 600
+	}
+	return w.status >= 200 && w.status < 300
+}
+
+func sniffHTML(sample []byte) htmlCandidate {
+	if len(sample) == 0 {
+		return candidateMaybe
+	}
+
+	// Only need a small prefix.
+	if len(sample) > 2048 {
+		sample = sample[:2048]
+	}
+
+	lower := bytes.ToLower(sample)
+
+	// Trim leading whitespace (best-effort).
+	lower = bytes.TrimLeft(lower, " \t\r\n")
+
+	// Strong HTML indicators.
+	if bytes.HasPrefix(lower, []byte("<!doctype html")) {
+		return candidateYes
+	}
+	if bytes.HasPrefix(lower, []byte("<html")) {
+		return candidateYes
+	}
+
+	// Common early tags for HTML documents.
+	if bytes.Contains(lower, []byte("<head")) || bytes.Contains(lower, []byte("<body")) {
+		return candidateYes
+	}
+
+	// If it starts like XML, likely not HTML (unless xhtml, but that usually has CT set).
+	if bytes.HasPrefix(lower, []byte("<?xml")) {
+		return candidateNo
+	}
+
+	// Not enough evidence yet.
+	return candidateMaybe
 }
 
 //nolint:funlen
@@ -185,17 +280,8 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 		return w.orig.Write(p)
 	}
 
-	// undecided: buffer up to lookaheadLimit, decide ASAP.
 	if len(p) == 0 {
 		return 0, nil
-	}
-
-	// If response obviously not eligible, decide passthrough immediately.
-	if !w.isCandidateHTML() {
-		w.state = passthrough
-		w.flushHeaders()
-		w.flushBuffer()
-		return w.orig.Write(p)
 	}
 
 	// Avoid corrupting compressed responses (unless you implement decompress/recompress).
@@ -206,25 +292,74 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 		return w.orig.Write(p)
 	}
 
-	// If already contains the script in the early bytes, don’t inject.
-	if w.buf.Len() > 0 && bytes.Contains(w.buf.Bytes(), []byte(w.scriptSrc)) {
+	// Buffer up to lookaheadLimit.
+	remaining := w.lookaheadLimit - w.buf.Len()
+
+	if remaining <= 0 && w.state == undecided {
+		// We can’t buffer more; fall back to passthrough.
 		w.state = passthrough
 		w.flushHeaders()
 		w.flushBuffer()
 		return w.orig.Write(p)
 	}
 
-	remaining := w.lookaheadLimit - w.buf.Len()
+	consumed := 0
 	if remaining > 0 {
 		if len(p) <= remaining {
 			_, _ = w.buf.Write(p)
+			consumed = len(p)
 		} else {
 			_, _ = w.buf.Write(p[:remaining])
-			// We’ll passthrough the rest below if we can’t decide.
+			consumed = remaining
 		}
 	}
 
-	updated, ok := tryInject(w.buf.Bytes(), w.scriptSrc, w.websiteID, w.injectBefore, w.alsoMatchBodyClose)
+	bufBytes := w.buf.Bytes()
+
+	// Decide if this is HTML (status + header or sniff).
+	cand := w.htmlCandidateFromHeadersAndSniff(bufBytes)
+	if cand == candidateNo {
+		w.state = passthrough
+		w.flushHeaders()
+		w.flushBuffer()
+
+		if consumed < len(p) {
+			return w.orig.Write(p[consumed:])
+		}
+		return len(p), nil
+	}
+
+	// If already contains the script in buffered bytes, don’t inject.
+	if bytes.Contains(bufBytes, []byte(w.scriptSrc)) {
+		w.state = passthrough
+		w.flushHeaders()
+		w.flushBuffer()
+
+		if consumed < len(p) {
+			return w.orig.Write(p[consumed:])
+		}
+		return len(p), nil
+	}
+
+	// If maybe, keep buffering until we can decide or hit lookahead limit.
+	if cand == candidateMaybe {
+		if w.buf.Len() >= w.lookaheadLimit {
+			w.state = passthrough
+			w.flushHeaders()
+			w.flushBuffer()
+
+			if consumed < len(p) {
+				return w.orig.Write(p[consumed:])
+			}
+			return len(p), nil
+		}
+
+		// Keep buffering; don't forward yet.
+		return len(p), nil
+	}
+
+	// cand == candidateYes => try injection with current buffer.
+	updated, ok := tryInject(bufBytes, w.scriptSrc, w.websiteID, w.injectBefore, w.alsoMatchBodyClose)
 	if ok {
 		w.state = injecting
 		w.prepareHeadersForInjection()
@@ -235,46 +370,30 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 			return len(p), err
 		}
 
-		// If p had extra beyond the lookahead, write it too.
-		if remaining < len(p) {
-			_, err2 := w.orig.Write(p[remaining:])
+		if consumed < len(p) {
+			_, err2 := w.orig.Write(p[consumed:])
 			if err2 != nil {
 				return len(p), err2
 			}
 		}
 
-		// Clear buffer (we already wrote it).
 		w.buf.Reset()
 		return len(p), nil
 	}
 
-	// If we reached lookahead limit and still can’t inject, switch to passthrough.
+	// Still HTML but couldn't inject yet; if we hit lookahead limit, give up.
 	if w.buf.Len() >= w.lookaheadLimit {
 		w.state = passthrough
 		w.flushHeaders()
 		w.flushBuffer()
 
-		if remaining < len(p) {
-			return w.orig.Write(p[remaining:])
+		if consumed < len(p) {
+			return w.orig.Write(p[consumed:])
 		}
-
 		return len(p), nil
 	}
 
-	// Still undecided, keep buffering.
 	return len(p), nil
-}
-
-func (w *streamWriter) isCandidateHTML() bool {
-	if w.status < 200 || w.status >= 300 {
-		return false
-	}
-
-	ct := strings.ToLower(w.header.Get("Content-Type"))
-	if strings.Contains(ct, "text/html") {
-		return true
-	}
-	return strings.Contains(ct, "application/xhtml+xml")
 }
 
 func (w *streamWriter) prepareHeadersForInjection() {

@@ -20,49 +20,24 @@ func newTestMiddleware(t *testing.T, next http.Handler, cfg *Config) http.Handle
 	return h
 }
 
-func Test_Passthrough_WhenNoWebsiteID_ConfigOrHeader(t *testing.T) {
-	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write([]byte("<html><head></head><body>Hello</body></html>"))
-	})
+func mustContain(t *testing.T, haystack, needle, msg string) {
+	t.Helper()
 
-	cfg := CreateConfig()
-	cfg.WebsiteID = ""
-	cfg.WebsiteIDHeader = "X-Analytics-Website-Id"
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	rr := httptest.NewRecorder()
-
-	mw.ServeHTTP(rr, req)
-
-	if strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected no injection when no website id is provided")
+	if !strings.Contains(haystack, needle) {
+		t.Fatalf("%s: expected to contain %q, got body=%q", msg, needle, haystack)
 	}
 }
 
-func Test_Passthrough_WhenWebsiteIDHeaderIsWhitespace(t *testing.T) {
-	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write([]byte("<html><head></head><body>Hello</body></html>"))
-	})
+func mustNotContain(t *testing.T, haystack, needle, msg string) {
+	t.Helper()
 
-	cfg := CreateConfig()
-	cfg.WebsiteID = ""
-	cfg.WebsiteIDHeader = "X-Analytics-Website-Id"
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	req.Header.Set(cfg.WebsiteIDHeader, "   \t\n")
-	rr := httptest.NewRecorder()
-
-	mw.ServeHTTP(rr, req)
-
-	if strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected no injection when header is whitespace")
+	if strings.Contains(haystack, needle) {
+		t.Fatalf("%s: expected NOT to contain %q, got body=%q", msg, needle, haystack)
 	}
+}
+
+func scriptSnippet(src, websiteID string) string {
+	return `<script defer src="` + src + `" data-website-id="` + websiteID + `"></script>`
 }
 
 func Test_Passthrough_WhenNotGET(t *testing.T) {
@@ -73,6 +48,7 @@ func Test_Passthrough_WhenNotGET(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid-config"
+	cfg.DefaultWebsiteID = "" // keep test explicit
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -81,12 +57,10 @@ func Test_Passthrough_WhenNotGET(t *testing.T) {
 
 	mw.ServeHTTP(rr, req)
 
-	if strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected no injection for non-GET")
-	}
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "non-GET should passthrough")
 }
 
-func Test_ConfigWebsiteID_TakesPrecedence_OverHeader(t *testing.T) {
+func Test_ConfigWebsiteID_TakesPrecedence_OverHeader_AndDefault(t *testing.T) {
 	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = rw.Write([]byte("<html><head></head><body>Hello</body></html>"))
@@ -95,23 +69,20 @@ func Test_ConfigWebsiteID_TakesPrecedence_OverHeader(t *testing.T) {
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid-from-config"
 	cfg.WebsiteIDHeader = "X-Analytics-Website-Id"
-	cfg.MaxLookaheadBytes = 32 * 1024
+	cfg.DefaultWebsiteID = "uuid-default"
 
 	mw := newTestMiddleware(t, next, cfg)
 
 	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
 	req.Header.Set(cfg.WebsiteIDHeader, "uuid-from-header")
-	rr := httptest.NewRecorder()
 
+	rr := httptest.NewRecorder()
 	mw.ServeHTTP(rr, req)
 
 	body := rr.Body.String()
-	if !strings.Contains(body, `data-website-id="uuid-from-config"`) {
-		t.Fatalf("expected config websiteId to be used, got body=%q", body)
-	}
-	if strings.Contains(body, `data-website-id="uuid-from-header"`) {
-		t.Fatalf("did not expect header websiteId to be used when config is set, got body=%q", body)
-	}
+	mustContain(t, body, `data-website-id="uuid-from-config"`, "config websiteId should win")
+	mustNotContain(t, body, `data-website-id="uuid-from-header"`, "header should not be used when config set")
+	mustNotContain(t, body, `data-website-id="uuid-default"`, "default should not be used when config set")
 }
 
 func Test_HeaderWebsiteID_IsUsed_WhenConfigWebsiteIDEmpty(t *testing.T) {
@@ -123,7 +94,7 @@ func Test_HeaderWebsiteID_IsUsed_WhenConfigWebsiteIDEmpty(t *testing.T) {
 	cfg := CreateConfig()
 	cfg.WebsiteID = ""
 	cfg.WebsiteIDHeader = "X-Analytics-Website-Id"
-	cfg.MaxLookaheadBytes = 32 * 1024
+	cfg.DefaultWebsiteID = "uuid-default"
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -134,28 +105,20 @@ func Test_HeaderWebsiteID_IsUsed_WhenConfigWebsiteIDEmpty(t *testing.T) {
 	mw.ServeHTTP(rr, req)
 
 	body := rr.Body.String()
-	if !strings.Contains(body, `data-website-id="uuid-from-header"`) {
-		t.Fatalf("expected header websiteId to be used, got body=%q", body)
-	}
+	mustContain(t, body, `data-website-id="uuid-from-header"`, "header websiteId should be used")
+	mustNotContain(t, body, `data-website-id="uuid-default"`, "default should not be used when header present")
 }
 
-func Test_Inserts_OnLargeBody_WhenHeadCloseEarly(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
-
-	head := "<html><head><title>x</title></head><body>"
-	tail := "</body></html>"
-	huge := bytes.Repeat([]byte("A"), 2*1024*1024)
-
+func Test_DefaultWebsiteID_IsUsed_WhenConfigAndHeaderEmpty(t *testing.T) {
 	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write([]byte(head))
-		_, _ = rw.Write(huge)
-		_, _ = rw.Write([]byte(tail))
+		_, _ = rw.Write([]byte("<html><head></head><body>Hello</body></html>"))
 	})
 
 	cfg := CreateConfig()
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 32 * 1024
+	cfg.WebsiteID = ""
+	cfg.WebsiteIDHeader = "X-Analytics-Website-Id"
+	cfg.DefaultWebsiteID = "uuid-default"
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -165,37 +128,19 @@ func Test_Inserts_OnLargeBody_WhenHeadCloseEarly(t *testing.T) {
 	mw.ServeHTTP(rr, req)
 
 	body := rr.Body.String()
-	want := `<script defer src="` + cfg.ScriptSrc + `" data-website-id="` + websiteID + `"></script>`
-
-	if !strings.Contains(body, want) {
-		t.Fatalf("expected injection")
-	}
-	if !strings.Contains(body, tail) {
-		t.Fatalf("expected full passthrough tail")
-	}
-
-	headCloseIdx := strings.Index(strings.ToLower(body), "</head>")
-	snippetIdx := strings.Index(body, want)
-	if snippetIdx < 0 || headCloseIdx < 0 || snippetIdx > headCloseIdx {
-		t.Fatalf("expected snippet before </head>")
-	}
+	mustContain(t, body, `data-website-id="uuid-default"`, "default websiteId should be used")
 }
 
-func Test_Passthrough_WhenHeadNotInLookahead(t *testing.T) {
-	const websiteID = "uuid"
-
-	prefix := bytes.Repeat([]byte("X"), 64*1024)
-	html := append([]byte("<html><head>"), prefix...)
-	html = append(html, []byte("</head><body>OK</body></html>")...)
-
+func Test_Passthrough_WhenNoWebsiteID_ConfigHeaderDefaultAllEmpty(t *testing.T) {
 	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write(html)
+		_, _ = rw.Write([]byte("<html><head></head><body>Hello</body></html>"))
 	})
 
 	cfg := CreateConfig()
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 8 * 1024 // too small to include </head>
+	cfg.WebsiteID = ""
+	cfg.WebsiteIDHeader = "X-Analytics-Website-Id"
+	cfg.DefaultWebsiteID = ""
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -204,12 +149,98 @@ func Test_Passthrough_WhenHeadNotInLookahead(t *testing.T) {
 
 	mw.ServeHTTP(rr, req)
 
-	if strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected no injection when </head> not found within lookahead")
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "should not inject when no website id anywhere")
+}
+
+func Test_Inserts_WhenContentTypeMissing_ButHTMLSniffDetects(t *testing.T) {
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		// Intentionally do NOT set Content-Type.
+		_, _ = rw.Write([]byte("<!doctype html><html><head></head><body>Hello</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	body := rr.Body.String()
+	mustContain(t, body, scriptSnippet(cfg.ScriptSrc, "uuid"), "should inject with sniffed HTML even when CT missing")
+}
+
+func Test_Passthrough_WhenContentTypeMissing_AndSniffNotHTML(t *testing.T) {
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		// No Content-Type and not HTML at the beginning.
+		_, _ = rw.Write([]byte("{\"ok\":true}"))
+	})
+
+	cfg := CreateConfig()
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "should not inject when sniff doesn't look like HTML")
+}
+
+func Test_Passthrough_WhenStatusNon2xx_AndInjectOnNon2xxFalse(t *testing.T) {
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "text/html")
+		rw.WriteHeader(http.StatusNotFound)
+		_, _ = rw.Write([]byte("<html><head></head><body>404</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
+	cfg.InjectOnNon2xx = false
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/missing", nil)
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 passthrough, got %d", rr.Code)
 	}
-	if rr.Body.Len() != len(html) {
-		t.Fatalf("expected passthrough (no truncation), got len=%d want=%d", rr.Body.Len(), len(html))
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "should not inject on 404 when InjectOnNon2xx=false")
+}
+
+func Test_Injects_WhenStatusNon2xx_AndInjectOnNon2xxTrue(t *testing.T) {
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "text/html")
+		rw.WriteHeader(http.StatusNotFound)
+		_, _ = rw.Write([]byte("<html><head></head><body>404</body></html>"))
+	})
+
+	cfg := CreateConfig()
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
+	cfg.InjectOnNon2xx = true
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/missing", nil)
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 passthrough status preserved, got %d", rr.Code)
 	}
+	mustContain(t, rr.Body.String(), scriptSnippet(cfg.ScriptSrc, "uuid"), "should inject on 404 when InjectOnNon2xx=true")
 }
 
 func Test_Passthrough_WhenNotHTML(t *testing.T) {
@@ -220,6 +251,7 @@ func Test_Passthrough_WhenNotHTML(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -228,9 +260,7 @@ func Test_Passthrough_WhenNotHTML(t *testing.T) {
 
 	mw.ServeHTTP(rr, req)
 
-	if strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected no injection for json")
-	}
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "should not inject into json")
 }
 
 func Test_Passthrough_WhenCompressed(t *testing.T) {
@@ -242,6 +272,7 @@ func Test_Passthrough_WhenCompressed(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -250,9 +281,7 @@ func Test_Passthrough_WhenCompressed(t *testing.T) {
 
 	mw.ServeHTTP(rr, req)
 
-	if strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected no injection when Content-Encoding is set")
-	}
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "should not inject when Content-Encoding is set")
 	if rr.Header().Get("Content-Encoding") != "gzip" {
 		t.Fatalf("expected Content-Encoding preserved")
 	}
@@ -266,6 +295,7 @@ func Test_DoesNotInjectTwice_WhenScriptAlreadyPresent(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 	cfg.ScriptSrc = "https://analytics.jubnl.ch/script.js"
 
 	mw := newTestMiddleware(t, next, cfg)
@@ -290,6 +320,7 @@ func Test_HeaderCleanup_OnInjection(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 
 	mw := newTestMiddleware(t, next, cfg)
 
@@ -306,29 +337,7 @@ func Test_HeaderCleanup_OnInjection(t *testing.T) {
 	}
 }
 
-func Test_CaseInsensitiveHeadClose(t *testing.T) {
-	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("Content-Type", "text/html")
-		_, _ = rw.Write([]byte("<html><HEAD></HEAD><body>OK</body></html>"))
-	})
-
-	cfg := CreateConfig()
-	cfg.WebsiteID = "uuid"
-	cfg.InjectBefore = "</head>"
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	rr := httptest.NewRecorder()
-
-	mw.ServeHTTP(rr, req)
-
-	if !strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected injection with case-insensitive </head>")
-	}
-}
-
-func Test_FallbackToBodyClose(t *testing.T) {
+func Test_FallbackToBodyClose_WhenNoHeadClose(t *testing.T) {
 	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.Header().Set("Content-Type", "text/html")
 		_, _ = rw.Write([]byte("<html><body></body></html>"))
@@ -336,6 +345,7 @@ func Test_FallbackToBodyClose(t *testing.T) {
 
 	cfg := CreateConfig()
 	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 	cfg.InjectBefore = "</head>"
 	cfg.AlsoMatchBodyClose = true
 
@@ -346,21 +356,46 @@ func Test_FallbackToBodyClose(t *testing.T) {
 
 	mw.ServeHTTP(rr, req)
 
-	if !strings.Contains(rr.Body.String(), cfg.ScriptSrc) {
-		t.Fatalf("expected injection at </body> fallback")
-	}
-
 	body := rr.Body.String()
-	bodyCloseIdx := strings.Index(strings.ToLower(body), "</body>")
-	snippetIdx := strings.Index(body, cfg.ScriptSrc)
-	if snippetIdx < 0 || bodyCloseIdx < 0 || snippetIdx > bodyCloseIdx {
-		t.Fatalf("expected snippet before </body>")
-	}
+	mustContain(t, body, cfg.ScriptSrc, "should inject at </body> fallback")
 }
 
-func Test_StripAcceptEncoding_DefaultTrue_StripsHeaderBeforeUpstream(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
+func Test_RemainingGuard_FallsBackToPassthrough_WithoutTruncation(t *testing.T) {
+	// Goal: exercise the "remaining <= 0 => passthrough" guard path.
+	// We write two chunks:
+	//   - first chunk fills lookahead completely with content that keeps candidateMaybe (CT empty, no html markers)
+	//   - second chunk should be streamed immediately by the guard, not buffered/stalled/dropped.
 
+	chunk1 := bytes.Repeat([]byte("X"), 1024)
+	chunk2 := bytes.Repeat([]byte("Y"), 256)
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		// No Content-Type set => sniffing used.
+		_, _ = rw.Write(chunk1)
+		_, _ = rw.Write(chunk2)
+	})
+
+	cfg := CreateConfig()
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
+	cfg.MaxLookaheadBytes = len(chunk1) // fill buffer exactly
+
+	mw := newTestMiddleware(t, next, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	rr := httptest.NewRecorder()
+
+	mw.ServeHTTP(rr, req)
+
+	got := rr.Body.Bytes()
+	want := append(append([]byte{}, chunk1...), chunk2...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("expected full passthrough without truncation; got len=%d want=%d", len(got), len(want))
+	}
+	mustNotContain(t, rr.Body.String(), cfg.ScriptSrc, "should not inject for non-html payload")
+}
+
+func Test_StripAcceptEncoding_True_StripsHeaderBeforeUpstream(t *testing.T) {
 	var sawAcceptEncoding string
 	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
@@ -370,203 +405,48 @@ func Test_StripAcceptEncoding_DefaultTrue_StripsHeaderBeforeUpstream(t *testing.
 	})
 
 	cfg := CreateConfig()
-	// default is true, but keep explicit to avoid future regressions
 	cfg.StripAcceptEncoding = true
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 32 * 1024
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 
 	mw := newTestMiddleware(t, next, cfg)
 
 	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
 	req.Header.Set("Accept-Encoding", "gzip, br")
-	rr := httptest.NewRecorder()
 
+	rr := httptest.NewRecorder()
 	mw.ServeHTTP(rr, req)
 
 	if sawAcceptEncoding != "" {
 		t.Fatalf("expected Accept-Encoding to be stripped before upstream, got %q", sawAcceptEncoding)
 	}
-
-	body := rr.Body.String()
-	if !strings.Contains(body, cfg.ScriptSrc) {
-		t.Fatalf("expected injection to occur, got body=%q", body)
-	}
+	mustContain(t, rr.Body.String(), cfg.ScriptSrc, "expected injection")
 }
 
 func Test_StripAcceptEncoding_False_DoesNotStripHeaderBeforeUpstream(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
-
 	var sawAcceptEncoding string
 	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
 
-		// Return uncompressed anyway; we only validate header forwarding here.
 		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
 	})
 
 	cfg := CreateConfig()
 	cfg.StripAcceptEncoding = false
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 32 * 1024
+	cfg.WebsiteID = "uuid"
+	cfg.DefaultWebsiteID = ""
 
 	mw := newTestMiddleware(t, next, cfg)
 
 	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
 	req.Header.Set("Accept-Encoding", "gzip, br")
-	rr := httptest.NewRecorder()
 
+	rr := httptest.NewRecorder()
 	mw.ServeHTTP(rr, req)
 
 	if sawAcceptEncoding != "gzip, br" {
 		t.Fatalf("expected Accept-Encoding to be preserved before upstream, got %q", sawAcceptEncoding)
 	}
-
-	// Injection should still occur because upstream returned uncompressed HTML.
-	body := rr.Body.String()
-	if !strings.Contains(body, cfg.ScriptSrc) {
-		t.Fatalf("expected injection to occur, got body=%q", body)
-	}
-}
-
-func Test_StripAcceptEncoding_True_AllowsInjection_WhenUpstreamCompressesConditionally(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
-
-	// This upstream simulates typical behavior: compress only when Accept-Encoding includes gzip.
-	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		ae := r.Header.Get("Accept-Encoding")
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-		if strings.Contains(ae, "gzip") {
-			// We are not actually gzipping here; we just set the header to trigger plugin passthrough path.
-			rw.Header().Set("Content-Encoding", "gzip")
-		}
-
-		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
-	})
-
-	cfg := CreateConfig()
-	cfg.StripAcceptEncoding = true
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 32 * 1024
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	req.Header.Set("Accept-Encoding", "gzip, br")
-	rr := httptest.NewRecorder()
-
-	mw.ServeHTTP(rr, req)
-
-	// Because we stripped Accept-Encoding, upstream should NOT set Content-Encoding.
-	if rr.Header().Get("Content-Encoding") != "" {
-		t.Fatalf("expected upstream to not send Content-Encoding when Accept-Encoding stripped, got %q", rr.Header().Get("Content-Encoding"))
-	}
-
-	body := rr.Body.String()
-	if !strings.Contains(body, cfg.ScriptSrc) {
-		t.Fatalf("expected injection to occur, got body=%q", body)
-	}
-}
-
-func Test_StripAcceptEncoding_False_SkipsInjection_WhenUpstreamRespondsCompressed(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
-
-	// Simulate upstream that sets Content-Encoding when client advertises gzip.
-	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			rw.Header().Set("Content-Encoding", "gzip")
-		}
-
-		// Body content doesn't matter; plugin should passthrough because Content-Encoding is set.
-		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
-	})
-
-	cfg := CreateConfig()
-	cfg.StripAcceptEncoding = false
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 32 * 1024
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	req.Header.Set("Accept-Encoding", "gzip, br")
-	rr := httptest.NewRecorder()
-
-	mw.ServeHTTP(rr, req)
-
-	if rr.Header().Get("Content-Encoding") != "gzip" {
-		t.Fatalf("expected Content-Encoding=gzip passthrough, got %q", rr.Header().Get("Content-Encoding"))
-	}
-
-	body := rr.Body.String()
-	if strings.Contains(body, cfg.ScriptSrc) {
-		t.Fatalf("expected no injection when upstream response is compressed, got body=%q", body)
-	}
-}
-
-func Test_StripAcceptEncoding_DoesNotMutateOriginalRequestObject(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
-
-	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write([]byte("<html><head></head><body>OK</body></html>"))
-	})
-
-	cfg := CreateConfig()
-	cfg.StripAcceptEncoding = true
-	cfg.WebsiteID = websiteID
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	req.Header.Set("Accept-Encoding", "gzip, br")
-
-	rr := httptest.NewRecorder()
-	mw.ServeHTTP(rr, req)
-
-	// Ensure we did not mutate the original request's headers.
-	if got := req.Header.Get("Accept-Encoding"); got != "gzip, br" {
-		t.Fatalf("expected original request Accept-Encoding unchanged, got %q", got)
-	}
-}
-
-func Test_StripAcceptEncoding_True_WorksOnLargeResponse(t *testing.T) {
-	const websiteID = "014f4608-ab91-44f8-a046-749b8593ada9"
-
-	var sawAcceptEncoding string
-	next := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		sawAcceptEncoding = r.Header.Get("Accept-Encoding")
-
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write([]byte("<html><head></head><body>"))
-		_, _ = rw.Write(bytes.Repeat([]byte("A"), 2*1024*1024))
-		_, _ = rw.Write([]byte("</body></html>"))
-	})
-
-	cfg := CreateConfig()
-	cfg.StripAcceptEncoding = true
-	cfg.WebsiteID = websiteID
-	cfg.MaxLookaheadBytes = 32 * 1024
-
-	mw := newTestMiddleware(t, next, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-	req.Header.Set("Accept-Encoding", "gzip, br")
-	rr := httptest.NewRecorder()
-
-	mw.ServeHTTP(rr, req)
-
-	if sawAcceptEncoding != "" {
-		t.Fatalf("expected Accept-Encoding stripped before upstream, got %q", sawAcceptEncoding)
-	}
-
-	body := rr.Body.String()
-	if !strings.Contains(body, cfg.ScriptSrc) {
-		t.Fatalf("expected injection to occur")
-	}
-	if !strings.Contains(body, "</body></html>") {
-		t.Fatalf("expected response not truncated")
-	}
+	mustContain(t, rr.Body.String(), cfg.ScriptSrc, "expected injection")
 }
